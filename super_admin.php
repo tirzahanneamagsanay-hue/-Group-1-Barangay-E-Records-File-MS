@@ -3,17 +3,19 @@ require_once 'includes/auth.php';
 requireLogin();
 require_once 'includes/db.php';
 
-// Only super admins can access
+// Block access for anyone who isn't a superadmin — redirect silently to dashboard
 if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'superadmin') {
     header('Location: dashboard.php');
     exit;
 }
 
+// Returns null instead of empty string so optional DB fields stay truly NULL
 function nullIfEmpty(?string $val): ?string {
     $v = trim($val ?? '');
     return $v !== '' ? $v : null;
 }
 
+// Converts a datetime string to a human-readable "time ago" label
 function timeAgo($dt) {
     if (!$dt) return 'N/A';
     $diff = time() - strtotime($dt);
@@ -24,6 +26,7 @@ function timeAgo($dt) {
     return date('M j, Y', strtotime($dt));
 }
 
+// Writes an audit trail entry — always call this after any user/settings mutation
 function logActivity($conn, $action, $details) {
     $user_id = $_SESSION['user_id'];
     $stmt = $conn->prepare("INSERT INTO activity_logs (user_id, action, details, created_at) VALUES (?, ?, ?, NOW())");
@@ -32,7 +35,7 @@ function logActivity($conn, $action, $details) {
     $stmt->close();
 }
 
-// ── Load all settings from DB into an associative array ──
+// Loads all rows from system_settings into a flat key=>value array for easy access
 function getSettings($conn): array {
     $result = $conn->query("SELECT setting_key, setting_value FROM system_settings");
     $settings = [];
@@ -44,11 +47,12 @@ function getSettings($conn): array {
     return $settings;
 }
 
+// Whitelist valid page slugs to prevent open redirect / unexpected content
 $page = $_GET['page'] ?? 'dashboard';
 $valid_pages = ['dashboard', 'users', 'analytics', 'settings'];
 if (!in_array($page, $valid_pages)) $page = 'dashboard';
 
-// ─── API: POST actions ────────────────────────────────────────────────────────
+// ── All POST actions are handled here and exit early, acting as a lightweight JSON API
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     header('Content-Type: application/json');
     $conn = getConnection();
@@ -67,6 +71,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $conn->close(); exit;
         }
 
+        // Check for duplicate username/email among non-deleted accounts only
         $check = $conn->prepare("SELECT id FROM users WHERE (email = ? OR username = ?) AND (deleted_at IS NULL)");
         $check->bind_param('ss', $email, $username);
         $check->execute();
@@ -76,6 +81,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         }
         $check->close();
 
+        // Hash password with bcrypt before storing — never store plain text
         $hash = password_hash($password, PASSWORD_BCRYPT);
         $stmt = $conn->prepare("INSERT INTO users (username, email, password, role, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NOW(), NOW())");
         $stmt->bind_param('sssss', $username, $email, $hash, $role, $status);
@@ -98,11 +104,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             echo json_encode(['ok' => false, 'msg' => 'Required fields missing.']);
             $conn->close(); exit;
         }
+
+        // Prevent the currently logged-in superadmin from demoting their own account
         if ($id == $_SESSION['user_id'] && $role !== $_SESSION['role']) {
             echo json_encode(['ok' => false, 'msg' => 'You cannot change your own role.']);
             $conn->close(); exit;
         }
 
+        // Ensure the new username/email isn't already taken by a different user
         $check = $conn->prepare("SELECT id FROM users WHERE (email = ? OR username = ?) AND id != ? AND (deleted_at IS NULL)");
         $check->bind_param('ssi', $email, $username, $id);
         $check->execute();
@@ -112,6 +121,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         }
         $check->close();
 
+        // Only re-hash and update password if a new one was actually provided
         if (!empty($password)) {
             $hash = password_hash($password, PASSWORD_BCRYPT);
             $stmt = $conn->prepare("UPDATE users SET username=?, email=?, password=?, role=?, status=?, updated_at=NOW() WHERE id=?");
@@ -126,12 +136,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $stmt->close(); $conn->close(); exit;
     }
 
-    // SOFT DELETE USER
+    // SOFT DELETE USER — sets deleted_at timestamp instead of removing the row so it can be restored later
     if ($action === 'delete') {
         $id = (int)($_POST['id'] ?? 0);
         if ($id <= 0) { echo json_encode(['ok' => false, 'msg' => 'Invalid user ID.']); $conn->close(); exit; }
+
+        // Prevent admins from locking themselves out
         if ($id == $_SESSION['user_id']) { echo json_encode(['ok' => false, 'msg' => 'You cannot delete your own account.']); $conn->close(); exit; }
 
+        // Fetch username before deletion for the activity log entry
         $uStmt = $conn->prepare("SELECT username FROM users WHERE id = ?");
         $uStmt->bind_param('i', $id);
         $uStmt->execute();
@@ -146,7 +159,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $stmt->close(); $conn->close(); exit;
     }
 
-    // RESTORE USER
+    // RESTORE USER — clears deleted_at so the user reappears in active lists
     if ($action === 'restore') {
         $id = (int)($_POST['id'] ?? 0);
         if ($id <= 0) { echo json_encode(['ok' => false, 'msg' => 'Invalid user ID.']); $conn->close(); exit; }
@@ -159,7 +172,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $stmt->close(); $conn->close(); exit;
     }
 
-    // TOGGLE STATUS
+    // TOGGLE STATUS — flips active <-> inactive; reads current value first to determine the next state
     if ($action === 'toggle_status') {
         $id = (int)($_POST['id'] ?? 0);
         if ($id <= 0) { echo json_encode(['ok' => false, 'msg' => 'Invalid user ID.']); $conn->close(); exit; }
@@ -182,7 +195,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $stmt->close(); $conn->close(); exit;
     }
 
-    // GET SINGLE USER
+    // GET SINGLE USER — used by the edit modal to pre-populate fields via AJAX
     if ($action === 'get') {
         $id = (int)($_POST['id'] ?? 0);
         $stmt = $conn->prepare("SELECT id, username, email, role, status FROM users WHERE id = ? LIMIT 1");
@@ -194,8 +207,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         exit;
     }
 
-    // SAVE SETTINGS — persists all settings to system_settings table
+    // SAVE SETTINGS — uses INSERT ... ON DUPLICATE KEY UPDATE so it works for both first-time inserts and updates
     if ($action === 'save_settings') {
+        // Whitelist of allowed setting keys — never trust field names from POST directly
         $allowed_fields = [
             'barangay_name', 'city', 'contact_email', 'contact_phone',
             'max_users_per_admin', 'session_timeout',
@@ -216,9 +230,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         }
 
         foreach ($allowed_fields as $key) {
-            // Checkboxes not submitted = unchecked = '0'
+            // Unchecked checkboxes aren't submitted by browsers, so treat missing values as '0'
             $value = $_POST[$key] ?? '0';
-            // Sanitize: strip tags for text fields
             $value = strip_tags(trim($value));
             $stmt->bind_param('ss', $key, $value);
             $stmt->execute();
@@ -234,13 +247,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     $conn->close(); exit;
 }
 
-// ─── Load page data ───────────────────────────────────────────────────────────
+// ── Page-level data loading starts here — only runs for normal GET requests
 $conn = getConnection();
 
-// Load persisted settings
 $settings = getSettings($conn);
 
-// Stats
+// Single query with conditional aggregation — avoids multiple round trips to count each status
 $stats = $conn->query("
     SELECT
         COUNT(*) AS total,
@@ -253,7 +265,7 @@ $stats = $conn->query("
     FROM users
 ")->fetch_assoc();
 
-// Users list
+// Build a dynamic WHERE clause based on active filters — each condition is appended only if needed
 $search       = trim($_GET['search'] ?? '');
 $filterRole   = $_GET['role'] ?? '';
 $filterStatus = $_GET['status'] ?? '';
@@ -263,6 +275,7 @@ $where  = [];
 $params = [];
 $types  = '';
 
+// Switch between active users and the deleted archive depending on the toggle
 if (!$showDeleted) {
     $where[] = "deleted_at IS NULL";
 } else {
@@ -276,6 +289,8 @@ if ($search) {
     $params[] = $like;
     $types   .= 'ss';
 }
+
+// Validate role/status filters against a fixed list to prevent SQL injection via the filter dropdowns
 if ($filterRole && in_array($filterRole, ['superadmin', 'admin', 'secretary', 'user'])) {
     $where[] = "role = ?"; $params[] = $filterRole; $types .= 's';
 }
@@ -287,19 +302,20 @@ $sql  = "SELECT * FROM users";
 if ($where) $sql .= " WHERE " . implode(" AND ", $where);
 $sql .= " ORDER BY created_at DESC";
 
+// Only call bind_param when there are actually parameters to bind
 $stmt = $conn->prepare($sql);
 if ($params) $stmt->bind_param($types, ...$params);
 $stmt->execute();
 $users = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $stmt->close();
 
-// Activity logs
+// Fetch the 50 most recent activity log entries joined with usernames for display
 $aStmt = $conn->prepare("SELECT a.*, u.username FROM activity_logs a LEFT JOIN users u ON a.user_id = u.id ORDER BY a.created_at DESC LIMIT 50");
 $aStmt->execute();
 $activities = $aStmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $aStmt->close();
 
-// Analytics
+// Pre-aggregate chart data server-side so Chart.js receives ready-to-render arrays
 $dailyUsers         = $conn->query("SELECT DATE(created_at) as date, COUNT(*) as count FROM users WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY) AND deleted_at IS NULL GROUP BY DATE(created_at) ORDER BY date ASC")->fetch_all(MYSQLI_ASSOC);
 $roleDistribution   = $conn->query("SELECT role, COUNT(*) as count FROM users WHERE deleted_at IS NULL GROUP BY role")->fetch_all(MYSQLI_ASSOC);
 $statusDistribution = $conn->query("SELECT status, COUNT(*) as count FROM users WHERE deleted_at IS NULL GROUP BY status")->fetch_all(MYSQLI_ASSOC);
@@ -313,7 +329,7 @@ $weeklySignups      = $conn->query("
 
 $conn->close();
 
-// ── Page meta for topbar title ──
+// Map page slugs to icon/label pairs so the topbar title renders correctly without extra conditionals
 $pageMeta = [
     'dashboard' => ['icon' => 'gauge-high',  'label' => 'Dashboard'],
     'users'     => ['icon' => 'users-gear',   'label' => 'User Management'],
@@ -868,7 +884,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
 </head>
 <body>
 
-<!-- ── Sidebar ── -->
+<!-- Sidebar -->
 <aside class="sidebar" id="sidebar">
     <div class="sidebar-brand">
         <div class="brand-seal"><i class="fas fa-landmark"></i></div>
@@ -908,11 +924,10 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
     </div>
 </aside>
 
-<!-- ── Main ── -->
+<!-- Main -->
 <div class="main">
 
     <header class="topbar">
-        <!-- ✅ FIXED: Page title now reflects the active $page from PHP -->
         <div class="page-title" id="pageTitle">
             <i class="fas fa-<?= $meta['icon'] ?>"></i>
             <span><?= $meta['label'] ?></span>
@@ -925,7 +940,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
 
     <div class="content">
 
-        <!-- ═══ PAGE: DASHBOARD ═══ -->
+        <!-- PAGE: DASHBOARD -->
         <div class="page-section <?= $page === 'dashboard' ? 'active' : '' ?>" id="page-dashboard">
 
             <div class="stats-grid">
@@ -984,6 +999,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
                 <div class="card-body">
                     <div class="activity-list">
                         <?php foreach (array_slice($activities, 0, 6) as $act):
+                            // Map action string to a CSS dot class for color-coded icons
                             $dotClass = 'default';
                             if (str_contains($act['action'], 'CREATED'))        $dotClass = 'created';
                             elseif (str_contains($act['action'], 'UPDATED'))    $dotClass = 'updated';
@@ -1010,7 +1026,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
             </div>
         </div>
 
-        <!-- ═══ PAGE: USER MANAGEMENT ═══ -->
+        <!-- PAGE: USER MANAGEMENT -->
         <div class="page-section <?= $page === 'users' ? 'active' : '' ?>" id="page-users">
 
             <div class="filter-bar">
@@ -1090,6 +1106,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
                                         <td><span class="badge badge-<?= $u['role'] ?>"><?= ucfirst($u['role']) ?></span></td>
                                         <td>
                                             <?php if (!$isSelf && !$u['deleted_at']): ?>
+                                                <!-- Clickable pill calls toggleStatus() via JS — disabled for self and deleted rows -->
                                                 <span class="status-pill sp-<?= $u['status'] ?>" onclick="toggleStatus(<?= $u['id'] ?>)" title="Click to toggle">
                                                     <?= ucfirst($u['status']) ?>
                                                 </span>
@@ -1106,6 +1123,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
                                                         <i class="fas fa-rotate-left"></i> Restore
                                                     </button>
                                                 <?php else: ?>
+                                                    <!-- Embed user data in data-* attributes so JS can fill the edit modal without an extra AJAX call -->
                                                     <button class="btn btn-ghost btn-sm editBtn"
                                                         data-id="<?= $u['id'] ?>"
                                                         data-username="<?= htmlspecialchars($u['username']) ?>"
@@ -1138,7 +1156,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
             </div>
         </div>
 
-        <!-- ═══ PAGE: ANALYTICS ═══ -->
+        <!-- PAGE: ANALYTICS -->
         <div class="page-section <?= $page === 'analytics' ? 'active' : '' ?>" id="page-analytics">
 
             <div class="stats-grid">
@@ -1231,7 +1249,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
             </div>
         </div>
 
-        <!-- ═══ PAGE: SETTINGS ═══ -->
+        <!-- PAGE: SETTINGS -->
         <div class="page-section <?= $page === 'settings' ? 'active' : '' ?>" id="page-settings">
             <div class="settings-grid">
 
@@ -1418,7 +1436,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
     </div><!-- /content -->
 </div><!-- /main -->
 
-<!-- ── Add / Edit User Modal ── -->
+<!-- Add / Edit User Modal -->
 <div class="modal-overlay" id="userModal">
     <div class="modal-box">
         <div class="modal-head">
@@ -1470,7 +1488,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
     </div>
 </div>
 
-<!-- ── Delete Confirmation Modal ── -->
+<!-- Delete Confirmation Modal -->
 <div class="modal-overlay" id="deleteModal">
     <div class="modal-box">
         <div class="modal-head">
@@ -1496,17 +1514,18 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
     </div>
 </div>
 
-<!-- ── Toast ── -->
+<!-- Toast notification -->
 <div id="toast"><i class="fas fa-circle-check" id="toastIcon"></i> <span id="toastMsg"></span></div>
 
-<!-- ───────────────── SCRIPTS ───────────────── -->
+<!-- SCRIPTS -->
 <script>
+    // PHP data passed to JS as JSON — used by Chart.js to render analytics charts
     const roleDist   = <?= json_encode($roleDistribution) ?>;
     const statusDist = <?= json_encode($statusDistribution) ?>;
     const dailyData  = <?= json_encode($dailyUsers) ?>;
     const weeklyData = <?= json_encode($weeklySignups) ?>;
 
-    // ── Live Clock ──
+    // Live clock — runs every second to keep the topbar timestamp accurate
     function updateClock() {
         const now = new Date();
         const pad = n => String(n).padStart(2, '0');
@@ -1520,7 +1539,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
     updateClock();
     setInterval(updateClock, 1000);
 
-    // ── Toast ──
+    // Toast — adds a class to trigger CSS transition, then clears it after a delay
     function showToast(msg, type = 'success') {
         const t = document.getElementById('toast');
         const icons = { success: 'circle-check', error: 'circle-xmark', info: 'circle-info' };
@@ -1531,19 +1550,21 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
         t._timer = setTimeout(() => t.className = '', 3200);
     }
 
-    // ── Modal helpers ──
+    // Modal open/close — driven by CSS class, not display:none, so transitions work
     function openModal(id)  { document.getElementById(id).classList.add('open'); }
     function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 
+    // Close buttons inside modals use data-close attribute to avoid hardcoding IDs
     document.querySelectorAll('[data-close]').forEach(el => {
         el.addEventListener('click', () => closeModal(el.dataset.close));
     });
 
+    // Close modal when clicking the backdrop (outside the modal box)
     document.querySelectorAll('.modal-overlay').forEach(m => {
         m.addEventListener('click', e => { if (e.target === m) closeModal(m.id); });
     });
 
-    // ── API helper ──
+    // Generic POST helper using FormData so the PHP side reads $_POST normally
     async function apiPost(data) {
         const fd = new FormData();
         for (const [k, v] of Object.entries(data)) fd.append(k, v);
@@ -1551,7 +1572,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
         return res.json();
     }
 
-    // ── Add User ──
+    // Open add modal — reset the form so previous edit data doesn't bleed through
     document.getElementById('openAddModalBtn')?.addEventListener('click', () => {
         document.getElementById('modalTitle').textContent = 'Add User';
         document.getElementById('userForm').reset();
@@ -1560,7 +1581,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
         openModal('userModal');
     });
 
-    // ── Edit buttons ──
+    // Edit buttons — populate the modal from data-* attributes on the button itself
     document.querySelectorAll('.editBtn').forEach(btn => {
         btn.addEventListener('click', () => {
             document.getElementById('modalTitle').textContent = 'Edit User';
@@ -1575,7 +1596,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
         });
     });
 
-    // ── Save user form ──
+    // Form submit — the hidden userId field determines whether this is an add or edit action
     document.getElementById('userForm').addEventListener('submit', async e => {
         e.preventDefault();
         const id  = document.getElementById('userId').value;
@@ -1596,13 +1617,14 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
         if (result.ok) {
             showToast(result.msg, 'success');
             closeModal('userModal');
+            // Reload after a short delay so the toast is visible before the page refreshes
             setTimeout(() => location.reload(), 900);
         } else {
             showToast(result.msg, 'error');
         }
     });
 
-    // ── Toggle status ──
+    // Toggle status — exposed globally so onclick in the PHP-rendered table can call it
     window.toggleStatus = async function(userId) {
         const result = await apiPost({ action: 'toggle_status', id: userId });
         if (result.ok) {
@@ -1613,7 +1635,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
         }
     };
 
-    // ── Soft Delete ──
+    // Soft delete — store the pending ID so the confirm button knows which user to remove
     let pendingDeleteId = null;
     document.querySelectorAll('.deleteBtn').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -1636,7 +1658,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
         }
     });
 
-    // ── Restore ──
+    // Restore deleted user
     document.querySelectorAll('.restoreBtn').forEach(btn => {
         btn.addEventListener('click', async () => {
             const result = await apiPost({ action: 'restore', id: btn.dataset.id });
@@ -1649,7 +1671,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
         });
     });
 
-    // ── Save Settings ──
+    // Save settings — collects both named inputs and checkbox data-key toggles into one POST
     document.getElementById('saveSettingsBtn')?.addEventListener('click', async () => {
         const btn = document.getElementById('saveSettingsBtn');
         btn.disabled = true;
@@ -1657,12 +1679,12 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
 
         const data = { action: 'save_settings' };
 
-        // Text / number / email inputs
+        // Collect text/number/email inputs that have a name attribute
         document.querySelectorAll('#page-settings input[name], #page-settings select[name]').forEach(el => {
             data[el.name] = el.value;
         });
 
-        // Checkboxes: explicitly send '1' or '0'
+        // Checkboxes use data-key instead of name — send '1'/'0' explicitly since unchecked boxes aren't submitted
         document.querySelectorAll('#page-settings input[type="checkbox"][data-key]').forEach(el => {
             data[el.dataset.key] = el.checked ? '1' : '0';
         });
@@ -1673,12 +1695,12 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
         showToast(result.ok ? 'Settings saved successfully.' : result.msg, result.ok ? 'success' : 'error');
     });
 
-    // ── Discard Settings ──
+    // Discard settings — reload to restore last saved values from DB
     document.getElementById('discardSettingsBtn')?.addEventListener('click', () => {
         location.reload();
     });
 
-    // ── Charts ──
+    // Shared Chart.js defaults — keep legend and animation consistent across all charts
     const CHART_DEFAULTS = {
         plugins: { legend: { position: 'bottom', labels: { usePointStyle: true, pointStyle: 'circle', padding: 14, font: { family: 'DM Sans', size: 12 } } } },
         animation: { duration: 600 }
@@ -1687,6 +1709,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
     const ROLE_COLORS   = ['#6318a8','#1040a0','#18703e'];
     const STATUS_COLORS = ['#18703e','#a06010','#a82020','#888'];
 
+    // Reusable doughnut factory — accepts any label key so it works for both role and status data
     function makeDoughnut(id, dist, labelKey, colorPalette) {
         const el = document.getElementById(id);
         if (!el || !dist.length) return;
@@ -1753,6 +1776,7 @@ $meta = $pageMeta[$page] ?? $pageMeta['dashboard'];
         });
     }
 
+    // Defer chart rendering slightly so the DOM is fully painted before canvas sizing kicks in
     setTimeout(() => {
         makeDoughnut('dash-roleChart',   roleDist,   'role',   ROLE_COLORS);
         makeDoughnut('dash-statusChart', statusDist, 'status', STATUS_COLORS);

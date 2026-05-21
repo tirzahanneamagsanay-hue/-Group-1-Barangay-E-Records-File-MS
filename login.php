@@ -9,7 +9,7 @@
 
 require_once 'includes/auth.php';
 require_once 'includes/db.php';
-require_once 'includes/helpers.php';   // ← NEW
+require_once 'includes/helpers.php';   // <- NEW
 
 // If already logged in, go straight to the right page
 if (isLoggedIn()) {
@@ -31,14 +31,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } else {
         $conn = getConnection();
 
-        // ── Rate-limit check ───────────────────────────────
+        // Check if IP is rate-limited from failed attempts
         if (isLoginBlocked($conn, $ip)) {
             $mins    = lockoutMinutesRemaining($conn, $ip);
             $blocked = true;
             $error   = "Too many failed attempts. Please try again in {$mins} minute" . ($mins === 1 ? '' : 's') . '.';
             $conn->close();
         } else {
-            // ── Credential check ───────────────────────────
+            // Query user by username, only if not deleted and active
             $stmt = $conn->prepare(
                 "SELECT id, full_name, password, role
                  FROM users
@@ -52,8 +52,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $user = $stmt->get_result()->fetch_assoc();
             $stmt->close();
 
+            // Verify password hash and log in on success
             if ($user && password_verify($password, $user['password'])) {
-                // Success — regenerate session to prevent fixation
+                // Regenerate session ID to prevent session fixation attacks
                 session_regenerate_id(true);
 
                 $_SESSION['user_id']   = $user['id'];
@@ -67,7 +68,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $upd->execute();
                 $upd->close();
 
-                // Audit log — successful login
+                // Log successful login for audit trail
                 $log = $conn->prepare(
                     "INSERT INTO audit_log (user_id, action, details, ip_address)
                      VALUES (?, 'LOGIN', 'Successful login', ?)"
@@ -85,7 +86,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } else {
                 $error = 'Invalid username or password.';
 
-                // Audit log — failed attempt
+                // Log failed attempt for rate-limiting (recorded in helpers.php logic)
                 $log = $conn->prepare(
                     "INSERT INTO audit_log (user_id, action, details, ip_address)
                      VALUES (NULL, 'LOGIN_FAILED', CONCAT('Failed attempt for username: ', ?), ?)"
@@ -237,7 +238,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         .toggle-pw:hover { color: #0a2a5e; }
 
-        /* Error box — normal (red) */
+        /* Error box for login failures */
         .error-box {
             background: #fff0f0;
             border: 1px solid #f0b0b0;
@@ -251,7 +252,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             gap: 8px;
         }
 
-        /* Error box — rate-limit (amber) */
+        /* Rate-limit error uses amber styling instead of red */
         .error-box.blocked {
             background: #fffbe6;
             border-color: #f0c040;
@@ -362,6 +363,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 </div>
 
 <script>
+    // Toggle password field visibility with eye icon
     function togglePassword() {
         var pw   = document.getElementById('password');
         var icon = document.getElementById('eyeIcon');
